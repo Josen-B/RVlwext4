@@ -13,7 +13,7 @@ use crate::disknode::{Ext4ExtentHeader, Ext4Extent};
 
 ///暂未实现多级exend索引
 /// 根据 inode 的逻辑块号解析到物理块号，支持 12 个直接块和 1/2/3 级间接块
-fn resolve_inode_block<B: BlockDevice>(
+pub fn resolve_inode_block<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     block_dev: &mut BlockDev<B>,
     inode: &Ext4Inode,

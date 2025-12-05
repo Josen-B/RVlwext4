@@ -14,12 +14,13 @@ use crate::blockgroup_description::Ext4GroupDesc;
 use crate::bmalloc::{BlockAllocator, InodeAllocator};
 use crate::bitmap_cache::{BitmapCache, CacheKey};
 use crate::config::*;
-use crate::tool::{debugSuperAndDesc, need_redundant_backup};
+use crate::tool::{cloc_group_layout, debugSuperAndDesc, need_redundant_backup};
+use alloc::collections::vec_deque::VecDeque;
 use log::{debug, error, info, warn};
 use alloc::vec::Vec;
 use alloc::string::{String, ToString};
 use crate::disknode::Ext4Inode;
-
+use crate::BlockDevError::BufferTooSmall;
 /// Ext4文件系统挂载错误
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountError {
@@ -377,7 +378,7 @@ impl Ext4FileSystem {
         Ok(group_descs)
     }
     
-    /// 卸载文件系统
+    /// 卸载文件系统 不写超级块备份
     pub fn umount<B: BlockDevice>(&mut self, block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
         if !self.mounted {
             return Ok(());
@@ -394,8 +395,17 @@ impl Ext4FileSystem {
         self.datablock_cache.flush_all(block_dev)?;
         debug!("Data block cache flushed");
         
+        //同步group_desc 和 super_block计数
+        let mut real_free_blocks :u64=0;
+        let mut real_free_inodes:u64=0;
+        for desc in &self.group_descs {
+            real_free_blocks+=desc.free_blocks_count() as u64;
+            real_free_inodes+=desc.free_inodes_count() as u64;
+        }
+        self.superblock.s_free_blocks_count_lo = (real_free_blocks & 0xFFFFFFFF) as u32;
+        self.superblock.s_free_blocks_count_hi = (real_free_blocks >> 32) as u32;
+        self.superblock.s_free_inodes_count = real_free_inodes as u32;
 
-        
         // 4. Update superblock
         info!("Writing back superblock...");
         self.sync_superblock(block_dev)?;
@@ -480,6 +490,7 @@ impl Ext4FileSystem {
         Ok(())
     }
 
+    /// 同时修改所有需要冗余备份的块组
     /// 同步超级块到磁盘
     fn sync_superblock<B: BlockDevice>(&self, block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
         write_superblock(block_dev, &self.superblock)
@@ -831,7 +842,7 @@ pub fn mkfs<B: BlockDevice>(block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
     debug!("  Blocks per group: {}", layout.blocks_per_group);
     debug!("  Inodes per group: {}", layout.inodes_per_group);
     
-    // 2. 构建并写入超级块
+    // 2. 构建并根据fearure写入到所有group超级块
     let superblock = build_superblock(
         total_blocks,
         &layout,
@@ -839,11 +850,19 @@ pub fn mkfs<B: BlockDevice>(block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
     write_superblock(block_dev, &superblock)?;
     debug!("Superblock written");
 
-    // 3. 为所有块组写入描述符（全部标记为UNINIT）
+    //写冗余备份 自动判断是否写
+    write_superblock_redundant_backup(block_dev, &superblock, total_groups, &layout)?;
+
+    //注意顺序
+    let mut descs:VecDeque<Ext4GroupDesc>=VecDeque::new();
+    // 3. 为superblock写入gdt（全部标记为UNINIT）
     for group_id in 0..total_groups {
         let desc = build_uninit_group_desc(&superblock,group_id, &layout);
         write_group_desc(block_dev, group_id, &desc)?;
+        descs.push_back(desc);
     }
+    //为其它块组选择性的写入冗余备份desc
+    write_gdt_redundant_backup(block_dev,  &descs, &superblock, total_groups, &layout)?;
     debug!("{} block group descriptors written", total_groups);
     
     // 4. 实际初始化块组0（用于根目录）
@@ -851,10 +870,8 @@ pub fn mkfs<B: BlockDevice>(block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
     debug!("Block group 0 initialized (for root directory)");
     
     // 4.5. 初始化其它块组的位图（全部视为空闲）
-    initialize_other_groups_bitmaps(block_dev, &layout)?;
+    initialize_other_groups_bitmaps(block_dev, &layout,&superblock)?;
 
-    //4.7. real write superblock and group desc backup
-    
     // 5. 通过一次挂载/卸载流程，让根目录在 mkfs 阶段就被真正创建并写回磁盘
     {
         let mut fs = Ext4FileSystem::mount(block_dev).expect("Mount Failed!");
@@ -911,6 +928,7 @@ fn build_superblock(
     sb.s_r_blocks_count_lo = (layout.reserved_blocks & 0xFFFFFFFF) as u32;
     sb.s_r_blocks_count_hi = (layout.reserved_blocks >> 32) as u32;
 
+    //注意！:这里是不准确的，也不打算改这里，而是最终在umount时从每个desc计算同步
     // 空闲计数：总块数 - 组0元数据块数 - 预留块数（其余组初始全空闲）
     let metadata_blocks = layout.group0_metadata_blocks as u64;
     let mut free_blocks = total_blocks
@@ -997,14 +1015,44 @@ fn build_uninit_group_desc(sb:&Ext4Superblock,group_id: u32, layout: &FsLayoutIn
     desc
 }
 
-/// 写入超级块到磁盘 管字节序
+
+///写备份超级块到所有组，从块组1开始
+fn write_superblock_redundant_backup<B: BlockDevice>(
+    block_dev: &mut BlockDev<B>,
+    sb: &Ext4Superblock,
+    groups_count:u32,
+    fs_layout:&FsLayoutInfo,
+) -> BlockDevResult<()> {
+
+    //从1开始
+    // sparse_superbllock特性判断
+    let sprse_feature = sb.has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER);
+    if sprse_feature {
+        for gid in 1..groups_count {
+            let group_layout = cloc_group_layout(gid, sb, fs_layout.blocks_per_group, 
+                fs_layout.inode_table_blocks, fs_layout.group0_block_bitmap, fs_layout.group0_inode_bitmap,
+                fs_layout.group0_inode_table, fs_layout.gdt_blocks);
+            //需要超级块备份
+            if need_redundant_backup(gid){
+                let super_blocks = group_layout.group_start_block;
+                block_dev.read_block(super_blocks as u32);
+                let buffer = block_dev.buffer_mut();
+                sb.to_disk_bytes(&mut buffer[0..SUPERBLOCK_SIZE]);
+                block_dev.write_block(super_blocks as u32)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+
+
+/// 写入超级块到磁盘 管字节序 不写备份
 fn write_superblock<B: BlockDevice>(
     block_dev: &mut BlockDev<B>,
     sb: &Ext4Superblock,
 ) -> BlockDevResult<()> {
     // 超级块总是从分区偏移 1024 字节开始，占用 1024 字节
-    // 对于 BLOCK_SIZE == 1024：超级块位于逻辑块 1 的起始处
-    // 对于 BLOCK_SIZE  > 1024：超级块位于逻辑块 0 内部偏移 1024 字节
     if BLOCK_SIZE == 1024 {
         block_dev.read_block(1)?;
         let buffer = block_dev.buffer_mut();
@@ -1018,6 +1066,7 @@ fn write_superblock<B: BlockDevice>(
         sb.to_disk_bytes(&mut buffer[offset..end]);
         block_dev.write_block(0)?;
     }
+
 
     Ok(())
 }
@@ -1043,7 +1092,60 @@ fn read_superblock<B: BlockDevice>(
     }
 }
 
-/// 写入块组描述符 管字节序
+///写入所有组的冗余备份中 自动判断特性
+fn write_gdt_redundant_backup<B: BlockDevice>(
+    block_dev: &mut BlockDev<B>,
+    descs: &VecDeque<Ext4GroupDesc>,
+    sb: &Ext4Superblock,
+    groups_count:u32,
+    fs_layout:&FsLayoutInfo
+) -> BlockDevResult<()> {
+    //参数合法性判断
+    let desc_all_size = descs.len()*GROUP_DESC_SIZE as usize;
+    let can_recive_size = fs_layout.gdt_blocks * fs_layout.descs_per_block * GROUP_DESC_SIZE as u32;
+    if can_recive_size < desc_all_size as u32 {
+       return Err(BlockDevError::BufferTooSmall { provided: can_recive_size as usize, required: desc_all_size });
+    }
+
+
+    let sprse_feature = sb.has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER);
+    if sprse_feature {
+        //为每个块组执行
+        for gid in 1..groups_count {
+            if need_redundant_backup(gid) {
+                let group_layout = cloc_group_layout(gid, sb, fs_layout.blocks_per_group, 
+                fs_layout.inode_table_blocks, fs_layout.group0_block_bitmap, fs_layout.group0_inode_bitmap,
+                fs_layout.group0_inode_table, fs_layout.gdt_blocks);
+                let gdt_start = group_layout.group_start_block+1;//跳过超级块
+
+
+                let mut desc_iter = descs.iter();
+                //循环写入desc
+                for gdt_block_id in gdt_start..group_layout.group_blcok_bitmap_startblocks {
+                    block_dev.read_block(gdt_block_id as u32)?;
+                    let buffer = block_dev.buffer_mut();
+                    let mut current_offset = 0_usize;//descoffset循环记录
+                    for _ in 0..fs_layout.descs_per_block {
+                        if let Some(desc) = desc_iter.next(){
+                            desc.to_disk_bytes(&mut buffer[current_offset..current_offset+GROUP_DESC_SIZE as usize]);
+                            current_offset+=GROUP_DESC_SIZE as usize;
+                        }
+                    }
+                    //写回磁盘
+                    block_dev.write_block(gdt_block_id as u32)?;
+                }
+            }
+        }
+    }
+
+
+
+    Ok(())
+
+}
+
+
+/// 写入块组0的描述符 管字节序
 fn write_group_desc<B: BlockDevice>(
     block_dev: &mut BlockDev<B>,
     group_id: u32,
@@ -1106,8 +1208,19 @@ fn initialize_group_0<B: BlockDevice>(
             let bit_idx = i % 8;
             buffer[byte_idx] |= 1 << bit_idx;
         }
+    
+
+        // 2.5padding无效inode为1
+        let bits_per_group =BLOCK_SIZE_U32*8;
+        for i in layout.inodes_per_group..bits_per_group {
+            let byte_idx :usize= (i/8) as usize;
+            let bit_idx = i%8;
+            buffer[byte_idx] |=1<<bit_idx;
+        } 
     }
     block_dev.write_block(inode_bitmap_blk)?;
+
+
     
     // 3. 清零inode表
     {
@@ -1139,15 +1252,14 @@ fn initialize_group_0<B: BlockDevice>(
 fn initialize_other_groups_bitmaps<B: BlockDevice>(
     block_dev: &mut BlockDev<B>,
     layout: &FsLayoutInfo,
+    sb:&Ext4Superblock
 ) -> BlockDevResult<()> {
     // 从块组1开始，逐组初始化
     for group_id in 1..layout.groups {
         // 使用与 build_uninit_group_desc 相同的布局计算
-        // 这里不依赖 superblock 里的标志位，只需传入一个默认值即可
-        let fake_sb = Ext4Superblock::default();
         let gl = crate::tool::cloc_group_layout(
             group_id,
-            &fake_sb,
+            &sb,
             layout.blocks_per_group,
             layout.inode_table_blocks,
             layout.group0_block_bitmap,
@@ -1173,10 +1285,19 @@ fn initialize_other_groups_bitmaps<B: BlockDevice>(
         }
         block_dev.write_block(block_bitmap_blk)?;
 
-        // 2. 初始化inode位图：全0 → 所有inode空闲
         {
+            // 2. 初始化inode位图：全0 → 所有inode空闲
             let buffer = block_dev.buffer_mut();
             buffer.fill(0);
+
+            // 2.5padding无效inode
+            let bits_per_group =BLOCK_SIZE_U32*8;
+            for i in layout.inodes_per_group..bits_per_group {
+                let byte_idx :usize= (i/8) as usize;
+                let bit_idx = i%8;
+                buffer[byte_idx] |=1<<bit_idx;
+            } 
+
         }
         block_dev.write_block(inode_bitmap_blk)?;
 

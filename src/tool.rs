@@ -45,8 +45,6 @@ pub fn is_numbers_power(number:usize,base:usize)->bool{
 }
 
 ///根据块组号 计算块组布局（仅在 mkfs 阶段使用）
-///
-/// 参数：
 /// - `gid` 当前块组号
 /// - `sb`  超级块（用于检查是否启用 sparse_super）
 /// - `blocks_per_group` 每组块数

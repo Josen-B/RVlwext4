@@ -6,6 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use crate::BLOCK_SIZE;
 use crate::blockdev::{BlockDev, BlockDevice, BlockDevResult, BlockDevError};
+use crate::loopfile::resolve_inode_block;
 use crate::{
     disknode::Ext4Inode,
     entries::Ext4DirEntry2,
@@ -287,9 +288,14 @@ pub fn create_lost_found_directory<B: BlockDevice>(
         desc.bg_used_dirs_count_hi = ((newc >> 16) & 0xFFFF) as u16;
     }
 
-    //  更新根目录数据块：加入 lost+found 目录项
+     //  更新根目录数据块：加入 lost+found 目录项
+
+    //这里也需要根据extend来解析
     let root_inode = fs.get_root(block_dev)?;
-    let root_block = root_inode.i_block[0];
+    let mut root_block=resolve_inode_block(fs, block_dev, &root_inode, 0)?.expect("lost+found logical_block can't map to physical blcok!");
+
+
+
     if root_block == 0 {
         return Err(BlockDevError::Corrupted);
     }
