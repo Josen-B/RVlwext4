@@ -84,7 +84,10 @@ impl HashTreeManager {
         dir_inode: &Ext4Inode,
         target_name: &[u8],
     ) -> Result<HashTreeSearchResult, HashTreeError> {
-        info!("Starting hash tree lookup: {:?}", core::str::from_utf8(target_name));
+        info!(
+            "Starting hash tree lookup: {:?}",
+            core::str::from_utf8(target_name)
+        );
 
         // 1. Check if directory has hash tree index enabled
         if !dir_inode.is_htree_indexed() {
@@ -108,7 +111,10 @@ impl HashTreeManager {
         match self.search_in_hash_tree(fs, block_dev, &root_info, target_hash, target_name) {
             Ok(result) => Ok(result),
             Err(e) => {
-                warn!("Hash tree lookup failed: {}, falling back to linear search", e);
+                warn!(
+                    "Hash tree lookup failed: {}, falling back to linear search",
+                    e
+                );
                 self.fallback_to_linear_search(fs, block_dev, dir_inode, target_name)
             }
         }
@@ -324,7 +330,10 @@ impl HashTreeManager {
         dir_inode: &Ext4Inode,
         target_name: &[u8],
     ) -> Result<HashTreeSearchResult, HashTreeError> {
-        info!("Using linear search: {:?}", core::str::from_utf8(target_name));
+        info!(
+            "Using linear search: {:?}",
+            core::str::from_utf8(target_name)
+        );
 
         let total_size = dir_inode.size() as usize;
         let block_bytes = BLOCK_SIZE as usize;

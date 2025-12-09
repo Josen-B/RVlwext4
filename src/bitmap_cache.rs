@@ -1,8 +1,8 @@
 //! 位图缓存模块
 
+use crate::blockdev::{BlockDev, BlockDevResult, BlockDevice};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use crate::blockdev::{BlockDev, BlockDevice, BlockDevResult};
 
 /// 位图类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -22,11 +22,17 @@ pub struct CacheKey {
 
 impl CacheKey {
     pub fn new_block(group_id: u32) -> Self {
-        Self { group_id, bitmap_type: BitmapType::Block }
+        Self {
+            group_id,
+            bitmap_type: BitmapType::Block,
+        }
     }
-    
+
     pub fn new_inode(group_id: u32) -> Self {
-        Self { group_id, bitmap_type: BitmapType::Inode }
+        Self {
+            group_id,
+            bitmap_type: BitmapType::Inode,
+        }
     }
 }
 
@@ -52,7 +58,7 @@ impl CachedBitmap {
             last_access: 0,
         }
     }
-    
+
     /// 标记为脏
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
@@ -78,12 +84,12 @@ impl BitmapCache {
             access_counter: 0,
         }
     }
-    
+
     /// 创建默认配置的缓存
     pub fn default() -> Self {
         Self::new(8)
     }
-    
+
     /// 获取位图（如果不存在则从磁盘加载） - 只读视图
     /// * `block_dev` - 块设备
     /// * `key` - 缓存键
@@ -112,8 +118,7 @@ impl BitmapCache {
             bitmap.last_access = self.access_counter;
         }
 
-        self
-            .cache
+        self.cache
             .get(&key)
             .ok_or(crate::blockdev::BlockDevError::Corrupted)
     }
@@ -146,17 +151,17 @@ impl BitmapCache {
             Err(crate::blockdev::BlockDevError::Corrupted)
         }
     }
-    
+
     /// 获取已缓存的位图（不加载）
     pub fn get(&self, key: &CacheKey) -> Option<&CachedBitmap> {
         self.cache.get(key)
     }
-    
+
     /// 获取可变引用
     pub fn get_mut(&mut self, key: &CacheKey) -> Option<&mut CachedBitmap> {
         self.cache.get_mut(key)
     }
-    
+
     /// 标记位图为脏
     pub fn mark_dirty(&mut self, key: &CacheKey) {
         if let Some(bitmap) = self.cache.get_mut(key) {
@@ -181,24 +186,22 @@ impl BitmapCache {
         bitmap.mark_dirty();
         Ok(())
     }
-    
+
     /// LRU淘汰：找到最久未访问的并写回（如果脏）
-    fn evict_lru<B: BlockDevice>(
-        &mut self,
-        block_dev: &mut BlockDev<B>,
-    ) -> BlockDevResult<()> {
-        let lru_key = self.cache
+    fn evict_lru<B: BlockDevice>(&mut self, block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
+        let lru_key = self
+            .cache
             .iter()
             .min_by_key(|(_, bitmap)| bitmap.last_access)
             .map(|(key, _)| *key);
-        
+
         if let Some(key) = lru_key {
             self.evict(block_dev, &key)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// 淘汰指定的位图
     pub fn evict<B: BlockDevice>(
         &mut self,
@@ -212,29 +215,27 @@ impl BitmapCache {
         }
         Ok(())
     }
-    
+
     /// 刷新所有脏位图到磁盘
-    pub fn flush_all<B: BlockDevice>(
-        &mut self,
-        block_dev: &mut BlockDev<B>,
-    ) -> BlockDevResult<()> {
-        let dirty_bitmaps: Vec<(u64, Vec<u8>)> = self.cache
+    pub fn flush_all<B: BlockDevice>(&mut self, block_dev: &mut BlockDev<B>) -> BlockDevResult<()> {
+        let dirty_bitmaps: Vec<(u64, Vec<u8>)> = self
+            .cache
             .iter()
             .filter(|(_, bitmap)| bitmap.dirty)
             .map(|(_, bitmap)| (bitmap.block_num, bitmap.data.clone()))
             .collect();
-        
+
         for (block_num, data) in dirty_bitmaps {
             Self::write_bitmap_static(block_dev, block_num, &data)?;
         }
-        
+
         for bitmap in self.cache.values_mut() {
             bitmap.dirty = false;
         }
-        
+
         Ok(())
     }
-    
+
     /// 刷新指定位图到磁盘
     pub fn flush<B: BlockDevice>(
         &mut self,
@@ -245,10 +246,10 @@ impl BitmapCache {
             if bitmap.dirty {
                 let block_num = bitmap.block_num;
                 let data = bitmap.data.clone();
-                
+
                 // 写回磁盘
                 Self::write_bitmap_static(block_dev, block_num, &data)?;
-                
+
                 // 清除脏标记
                 if let Some(bitmap) = self.cache.get_mut(key) {
                     bitmap.dirty = false;
@@ -257,7 +258,7 @@ impl BitmapCache {
         }
         Ok(())
     }
-    
+
     /// 静态方法：写位图到磁盘
     fn write_bitmap_static<B: BlockDevice>(
         block_dev: &mut BlockDev<B>,
@@ -270,18 +271,16 @@ impl BitmapCache {
         block_dev.write_block(block_num as u32)?;
         Ok(())
     }
-    
+
     /// 清空缓存（不写回）
     pub fn clear(&mut self) {
         self.cache.clear();
     }
-    
+
     /// 获取缓存统计
     pub fn stats(&self) -> CacheStats {
-        let dirty_count = self.cache.values()
-            .filter(|b| b.dirty)
-            .count();
-        
+        let dirty_count = self.cache.values().filter(|b| b.dirty).count();
+
         CacheStats {
             total_entries: self.cache.len(),
             dirty_entries: dirty_count,
@@ -302,32 +301,32 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use alloc::vec;
-    
+
     #[test]
     fn test_cache_key() {
         let key1 = CacheKey::new_block(0);
         let key2 = CacheKey::new_block(0);
         let key3 = CacheKey::new_inode(0);
-        
+
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
     }
-    
+
     #[test]
     fn test_cached_bitmap() {
         let data = vec![0u8; crate::BLOCK_SIZE];
         let mut bitmap = CachedBitmap::new(data, 10);
-        
+
         assert!(!bitmap.dirty);
         bitmap.mark_dirty();
         assert!(bitmap.dirty);
     }
-    
+
     #[test]
     fn test_bitmap_cache_basic() {
         let mut cache = BitmapCache::new(4);
         let stats = cache.stats();
-        
+
         assert_eq!(stats.total_entries, 0);
         assert_eq!(stats.max_entries, 4);
     }

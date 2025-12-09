@@ -1,27 +1,27 @@
-#![ no_std]
+#![no_std]
 
 extern crate alloc;
-pub mod config;
-pub mod endian;
-mod blockdev;
-pub mod mkd;
-mod disknode;
-mod superblock;
-mod entries;
+pub mod api;
 mod bitmap;
 mod bitmap_cache;
-mod inodetable_cache;
-mod datablock_cache;
+mod blockdev;
 mod blockgroup_description;
-pub mod ext4;
-mod loopfile;
-mod debug;
-mod tool;
 mod bmalloc;
+pub mod config;
+mod datablock_cache;
+mod debug;
+mod disknode;
+pub mod endian;
+mod entries;
+pub mod ext4;
 mod extents_tree;
 pub mod hashtree;
+mod inodetable_cache;
+mod loopfile;
+pub mod mkd;
 pub mod mkfile;
-pub mod api;
+mod superblock;
+mod tool;
 
 pub use crate::blockdev::*;
 pub use crate::config::*;
